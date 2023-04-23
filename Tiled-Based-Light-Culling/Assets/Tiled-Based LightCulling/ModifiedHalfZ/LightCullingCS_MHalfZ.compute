@@ -1,0 +1,363 @@
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "../Common/Shader/TiledBaseCSInclude.hlsl"
+
+//#pragma enable_d3d11_debug_symbols
+
+#pragma multi_compile _ _FRUSTUM_PLANE _FRUSTUM_AABB _FRUSTUM_PLANE_AABB_HYBRID _FRUSTUM_CONE
+#pragma multi_compile _ _LightCountDebug _LightCountDoubleDebug
+
+#pragma kernel LightCullingCS
+
+
+#define NUM_THREADS_CULLING TILE_SIZE * TILE_SIZE
+
+//输出
+RWStructuredBuffer<uint> _LightIndexListDouble;
+
+groupshared uint ldsLightCountA;
+groupshared uint ldsLightCountB;
+groupshared uint ldsLightList[MAX_NUM_LIGHTS_PER_TILE * 2];
+
+
+//-----------_FRUSTUM_CONE-----------
+#if defined(_FRUSTUM_CONE)
+    uint _NumLights;
+    StructuredBuffer<LightCone> _LightsData;
+    StructuredBuffer<FrustumCone> _InFrustumsVS;
+    Texture2D<float4> _InDepthBounds;
+
+    groupshared float3 ldsTileCenterVec;
+    groupshared float2 ldsTileConeSinCos;
+
+    groupshared float ldsTileMinDis;
+    groupshared float ldsTileMaxDis;
+    groupshared float ldsTileMaxDis2;
+    groupshared float ldsTileMinDis2;
+    groupshared float ldsTileHalfDis;
+
+//-----------_FRUSTUM_AABB-----------
+#elif defined(_FRUSTUM_AABB)
+    uint _NumLights;
+    StructuredBuffer<Sphere> _LightsData;
+    Texture2D<float4> _InDepthBounds;
+
+    groupshared float ldsTileHalfZ;
+    groupshared AABB ldsTileFrustumAABB1;
+    groupshared AABB ldsTileFrustumAABB2;
+
+//-----------_FRUSTUM_PLANE_AABB_HYBRID-----------
+#elif defined(_FRUSTUM_PLANE_AABB_HYBRID)
+    uint _NumLights;
+    StructuredBuffer<Sphere> _LightsData;
+    StructuredBuffer<Frustum> _InFrustumsVS;
+    Texture2D<float4> _InDepthBounds;
+
+    groupshared AABB ldsTileFrustumAABB1;
+    groupshared AABB ldsTileFrustumAABB2;
+    groupshared Frustum ldsTileFrustum;
+    groupshared float ldsTileMinZ;
+    groupshared float ldsTileMaxZ;
+    groupshared float ldsTileMinZ2;
+    groupshared float ldsTileMaxZ2;
+    groupshared float ldsTileHalfZ;
+
+//-----------_FRUSTUM_PLANE-----------
+#else
+    uint _NumLights;
+    StructuredBuffer<Sphere> _LightsData;
+    StructuredBuffer<Frustum> _InFrustumsVS;
+    Texture2D<float4> _InDepthBounds;
+
+    groupshared Frustum ldsTileFrustum;
+    groupshared float ldsTileMinZ;
+    groupshared float ldsTileMaxZ;
+    groupshared float ldsTileMinZ2;
+    groupshared float ldsTileMaxZ2;
+    groupshared float ldsTileHalfZ;
+
+#endif//数据
+
+//debug
+#if defined(_LightCountDebug) || defined(_LightCountDoubleDebug) 
+    RWTexture2D<float4> _DebugTexture;
+#endif
+
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void LightCullingCS(ComputeShaderInput IN)
+{
+    uint i = 0;
+//初始化
+#if defined(_FRUSTUM_CONE)
+    if(IN.groupIndex == 0)
+    {
+        uint tileFlatIndex = IN.groupID.x + IN.groupID.y * _NumTilesX;
+        FrustumCone frustumCone = _InFrustumsVS[tileFlatIndex];
+        ldsTileCenterVec = frustumCone.coneDir;
+        ldsTileConeSinCos = frustumCone.coneSinCos;
+
+        float4 depthBounds = _InDepthBounds.Load(uint3(IN.groupID.xy, 0));
+        ldsTileMinDis = depthBounds.x;
+        ldsTileMaxDis = depthBounds.w;
+        ldsTileMinDis2 = depthBounds.z;
+        ldsTileMaxDis2 = depthBounds.y;
+        ldsTileHalfDis = (ldsTileMinDis + ldsTileMaxDis) * 0.5f;
+
+        ldsLightCountA = 0;
+        ldsLightCountB = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+#elif defined(_FRUSTUM_AABB)
+    if(IN.groupIndex == 0)
+    {
+        float4 depthBounds = _InDepthBounds.Load(uint3(IN.groupID.xy, 0));
+        float tileMinDepth = depthBounds.x;
+        float tileMaxDepth = depthBounds.w;
+        float tileMinDepth2 = depthBounds.z;
+        float tileMaxDepth2 = depthBounds.y;
+        ldsTileHalfZ = (tileMinDepth + tileMaxDepth) * 0.5f;
+
+        ComputeFrustumDualAABB(IN.groupID.xy, tileMinDepth, tileMaxDepth2, tileMinDepth2, tileMaxDepth, ldsTileFrustumAABB1, ldsTileFrustumAABB2);
+
+        ldsLightCountA = 0;
+        ldsLightCountB = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+#elif defined(_FRUSTUM_PLANE_AABB_HYBRID)
+    if(IN.groupIndex == 0)
+    {
+        uint tileFlatIndex = IN.groupID.x + IN.groupID.y * _NumTilesX;
+        ldsTileFrustum = _InFrustumsVS[tileFlatIndex];
+
+        float4 depthBounds = _InDepthBounds.Load(uint3(IN.groupID.xy, 0));
+        ldsTileMinZ = depthBounds.x;
+        ldsTileMaxZ = depthBounds.w;
+        ldsTileMinZ2 = depthBounds.z;
+        ldsTileMaxZ2 = depthBounds.y;
+        ldsTileHalfZ = (ldsTileMinZ + ldsTileMaxZ) * 0.5f;
+
+        ComputeFrustumDualAABB(IN.groupID.xy, ldsTileMinZ, ldsTileMaxZ2, ldsTileMinZ2, ldsTileMaxZ, ldsTileFrustumAABB1, ldsTileFrustumAABB2);
+
+        ldsLightCountA = 0;
+        ldsLightCountB = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+#else
+    if(IN.groupIndex == 0)
+    {
+        uint tileFlatIndex = IN.groupID.x + IN.groupID.y * _NumTilesX;
+        ldsTileFrustum = _InFrustumsVS[tileFlatIndex];
+
+        float4 depthBounds = _InDepthBounds.Load(uint3(IN.groupID.xy, 0));
+        ldsTileMinZ = depthBounds.x;
+        ldsTileMaxZ = depthBounds.w;
+        ldsTileMinZ2 = depthBounds.z;
+        ldsTileMaxZ2 = depthBounds.y;
+        ldsTileHalfZ = (ldsTileMinZ + ldsTileMaxZ) * 0.5f;
+
+        ldsLightCountA = 0;
+        ldsLightCountB = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+#endif//初始化
+
+
+    //culling
+    for (i = IN.groupIndex; i < _NumLights; i += NUM_THREADS_CULLING)
+    {
+        bool testResult1 = false;//near half
+        bool testResult2 = false;//far half
+
+//--------------_FRUSTUM_CONE----------------
+        #if defined(_FRUSTUM_CONE)
+            LightCone lightConeData =_LightsData[i];
+            float2 lightMinMax;
+            bool testResult = SphericalSlicedCone_2(lightConeData, ldsTileCenterVec, ldsTileConeSinCos, ldsTileMinDis, ldsTileMaxDis, lightMinMax);
+            if(testResult)
+            {   
+                testResult1 = lightMinMax.x <= ldsTileMaxDis2;
+                testResult2 = lightMinMax.y >= ldsTileMinDis2;
+            }
+//--------------_FRUSTUM_AABB----------------     
+        #elif defined(_FRUSTUM_AABB)
+            Sphere lightSphere = _LightsData[i];
+            testResult1 = SphereIntersectsAABB(lightSphere, ldsTileFrustumAABB1);
+            testResult2 = SphereIntersectsAABB(lightSphere, ldsTileFrustumAABB2);
+
+//--------------_FRUSTUM_PLANE_AABB_HYBRID----------------
+        #elif defined(_FRUSTUM_PLANE_AABB_HYBRID)
+            Sphere lightSphere = _LightsData[i];
+            bool testResult = SphereInsideFrustum(lightSphere, ldsTileFrustum, ldsTileMinZ, ldsTileMaxZ);
+            if(testResult && (lightSphere.c.z + lightSphere.r > ldsTileMaxZ2))
+            {
+                testResult1 = SphereIntersectsAABB(lightSphere, ldsTileFrustumAABB1);
+            }
+
+            if(testResult && (lightSphere.c.z - lightSphere.r < ldsTileMinZ2))
+            {
+                testResult2 = SphereIntersectsAABB(lightSphere, ldsTileFrustumAABB2);
+            }
+
+//--------------_FRUSTUM_PLANE----------------
+        #else
+            Sphere lightSphere = _LightsData[i];
+            bool testResult = SphereInsideFrustum(lightSphere, ldsTileFrustum, ldsTileMinZ, ldsTileMaxZ);
+            if(testResult)
+            {
+                testResult1 = lightSphere.c.z + lightSphere.r > ldsTileMaxZ2;
+                testResult2 = lightSphere.c.z - lightSphere.r < ldsTileMinZ2;
+            }
+        #endif
+
+        if(testResult1)
+        {
+            uint index;
+            InterlockedAdd(ldsLightCountA, 1, index);
+            if (index < MAX_NUM_LIGHTS_PER_TILE)
+            {
+                ldsLightList[index] = i;
+            }
+        }
+
+        if(testResult2)
+        {
+            uint index;
+            InterlockedAdd(ldsLightCountB, 1, index);
+            if (index < MAX_NUM_LIGHTS_PER_TILE)
+            {
+                ldsLightList[MAX_NUM_LIGHTS_PER_TILE + index] = i;
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint tileFlatIndex = IN.groupID.x + IN.groupID.y * _NumTilesX;
+    uint startOffset = tileFlatIndex * (MAX_NUM_LIGHTS_PER_TILE  * 2 + 4);  
+    uint lightStartOffset = startOffset + 4;
+    uint lightCountA =  min(ldsLightCountA, MAX_NUM_LIGHTS_PER_TILE);
+    for ( i = IN.groupIndex; i < lightCountA; i += NUM_THREADS_CULLING)
+    {
+        _LightIndexListDouble[lightStartOffset + i] = ldsLightList[i];
+    }
+
+    lightStartOffset += MAX_NUM_LIGHTS_PER_TILE;
+    uint lightCountB =  min(ldsLightCountB, MAX_NUM_LIGHTS_PER_TILE);
+    for ( i = IN.groupIndex; i < lightCountB; i += NUM_THREADS_CULLING)
+    {
+        _LightIndexListDouble[lightStartOffset + i] = ldsLightList[i + MAX_NUM_LIGHTS_PER_TILE];
+    }
+
+    if(IN.groupIndex == 0)
+    {
+        #if defined(_FRUSTUM_CONE)
+            float fHalfZ = ldsTileHalfDis;
+        #else
+            float fHalfZ = ldsTileHalfZ;
+        #endif
+
+        // store fHalfZ for this tile as two 16-bit unsigned values
+        uint uHalfZBits = asuint(fHalfZ);
+        uint uHalfZBitsHigh = uHalfZBits >> 16;
+        uint uHalfZBitsLow = uHalfZBits & 0x0000FFFF;
+        _LightIndexListDouble[startOffset+0] = uHalfZBitsHigh;
+        _LightIndexListDouble[startOffset+1] = uHalfZBitsLow;
+        //_LightIndexListDouble[startOffset+0] = asuint(fHalfZ);
+
+        // store the light count for list A
+        _LightIndexListDouble[startOffset+2] = lightCountA;
+
+        // store the light count for list B
+        _LightIndexListDouble[startOffset+3] = lightCountB;
+    }
+
+    //debug
+    #if defined(_LightCountDoubleDebug)
+		const float3 heatMap[] = {  float3(0,0,0),
+			                        float3(0,0,1),
+			                        float3(0,1,1),
+			                        float3(0,1,0),
+			                        float3(1,1,0),
+			                        float3(1,0,0) };
+
+        if ( IN.groupThreadID.x == 0 || IN.groupThreadID.y == 0 )
+        {
+            _DebugTexture[IN.dispatchThreadID.xy] = float4( 0, 0, 0, 1 );
+        }
+        else if ( IN.groupThreadID.x == 1 || IN.groupThreadID.y == 1 )
+        {
+            _DebugTexture[IN.dispatchThreadID.xy] = float4( 1, 1, 1, 1 );
+        }
+        else if(IN.groupThreadID.y == (1 + TILE_SIZE / 2) )
+        {
+            _DebugTexture[IN.dispatchThreadID.xy] = float4( 0.5, 0.5, 0.5, 1 );
+        }
+        else if (IN.groupThreadID.y < (1 + TILE_SIZE / 2) )
+        {
+            if(ldsLightCountA <= MAX_NUM_LIGHTS_PER_TILE)
+            {
+		        const uint mapTexLen = 5;
+                float l = saturate((float)ldsLightCountA / MAX_NUM_LIGHTS_PER_TILE) * mapTexLen;
+		        float3 a = heatMap[floor(l)];
+		        float3 b = heatMap[ceil(l)];
+		        float4 heatMapColor = float4(lerp(a, b, l - floor(l)), 1.0);
+                _DebugTexture[IN.dispatchThreadID.xy] = heatMapColor;
+            }
+            else
+            {
+                _DebugTexture[IN.dispatchThreadID.xy] = float4(0.5, 0, 1, 1);
+            }
+        }
+        else
+        {
+            if(ldsLightCountB <= MAX_NUM_LIGHTS_PER_TILE)
+            {
+		        const uint mapTexLen = 5;
+                float l = saturate((float)ldsLightCountB / MAX_NUM_LIGHTS_PER_TILE) * mapTexLen;
+		        float3 a = heatMap[floor(l)];
+		        float3 b = heatMap[ceil(l)];
+		        float4 heatMapColor = float4(lerp(a, b, l - floor(l)), 1.0);
+                _DebugTexture[IN.dispatchThreadID.xy] = heatMapColor;
+            }
+            else
+            {
+                _DebugTexture[IN.dispatchThreadID.xy] = float4(0.5, 0, 1, 1);
+            }
+        }
+
+    #elif defined(_LightCountDebug)
+        if (IN.groupThreadID.x == 0 || IN.groupThreadID.y == 0)
+        {
+            _DebugTexture[IN.dispatchThreadID.xy] = float4(0, 0, 0, 1);
+        }
+        else if (IN.groupThreadID.x == 1 || IN.groupThreadID.y == 1)
+        {
+            _DebugTexture[IN.dispatchThreadID.xy] = float4(1, 1, 1, 1);
+        }
+        else
+        {
+            uint lightCount = max(ldsLightCountA, ldsLightCountB);
+            if(lightCount <= MAX_NUM_LIGHTS_PER_TILE)
+            {
+		        const float3 heatMap[] = {  float3(0,0,0),
+			                                float3(0,0,1),
+			                                float3(0,1,1),
+			                                float3(0,1,0),
+			                                float3(1,1,0),
+			                                float3(1,0,0) };
+		        const uint mapTexLen = 5;
+                float l = saturate((float)lightCount / MAX_NUM_LIGHTS_PER_TILE) * mapTexLen;
+		        float3 a = heatMap[floor(l)];
+		        float3 b = heatMap[ceil(l)];
+		        float4 heatMapColor = float4(lerp(a, b, l - floor(l)), 1.0);
+                _DebugTexture[IN.dispatchThreadID.xy] = heatMapColor;
+            }
+            else
+            {
+                _DebugTexture[IN.dispatchThreadID.xy] = float4(0.5, 0, 1, 1);
+            }
+        }
+    #endif
+}

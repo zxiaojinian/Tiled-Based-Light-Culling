@@ -1,0 +1,61 @@
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "TiledBaseCSInclude.hlsl"
+
+//#pragma enable_d3d11_debug_symbols
+
+#pragma multi_compile _ _FRUSTUM_CONE
+
+#pragma kernel CalculateFrustumCS
+
+#if defined(_FRUSTUM_CONE)
+    RWStructuredBuffer<FrustumCone> _OutFrustumsVS;
+#else
+    RWStructuredBuffer<Frustum> _OutFrustumsVS;
+#endif
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void CalculateFrustumCS(ComputeShaderInput IN)
+{
+    uint px = TILE_SIZE * IN.dispatchThreadID.x;
+    uint py = TILE_SIZE * IN.dispatchThreadID.y;
+    uint pxp = TILE_SIZE * (IN.dispatchThreadID.x + 1);
+    uint pyp = TILE_SIZE * (IN.dispatchThreadID.y + 1);
+
+    //远裁剪面4个点
+    float3 frustumTL = ScreenToView(float4(px, pyp, 1.f, 1.f)).xyz;
+    float3 frustumTR = ScreenToView(float4(pxp, pyp, 1.f, 1.f)).xyz;
+    float3 frustumBL = ScreenToView(float4(px, py, 1.f, 1.f)).xyz;
+    float3 frustumBR = ScreenToView(float4(pxp, py, 1.f, 1.f)).xyz;
+#if !defined(_FRUSTUM_CONE)
+    const float3 eyePos = float3(0, 0, 0);
+
+    Frustum frustum;
+    frustum.planes[0] = ComputePlane(eyePos, frustumBL, frustumTL);//L
+    frustum.planes[1] = ComputePlane(eyePos, frustumTR, frustumBR);//R
+    frustum.planes[2] = ComputePlane(eyePos, frustumTL, frustumTR);//T
+    frustum.planes[3] = ComputePlane(eyePos, frustumBR, frustumBL);//B
+
+    if ( IN.dispatchThreadID.x < _NumTilesX && IN.dispatchThreadID.y < _NumTilesY)
+    {
+        uint index = IN.dispatchThreadID.x + (IN.dispatchThreadID.y * _NumTilesX);
+        _OutFrustumsVS[index] = frustum;
+    }
+
+#else
+    frustumTL = normalize(frustumTL);
+    frustumTR = normalize(frustumTR);
+    frustumBL = normalize(frustumBL);
+    frustumBR = normalize(frustumBR);
+
+    float3 coneDir = normalize(frustumTL + frustumTR + frustumBL + frustumBR);
+    float coneCos = min(min(min(dot(coneDir, frustumTL), dot(coneDir, frustumTR)), dot(coneDir, frustumBL)), dot(coneDir, frustumBR));
+    float coneSin = sqrt(1 - coneCos * coneCos);
+    FrustumCone cone = {coneDir, float2(coneSin, coneCos)};
+
+    if ( IN.dispatchThreadID.x < _NumTilesX && IN.dispatchThreadID.y < _NumTilesY)
+    {
+        uint index = IN.dispatchThreadID.x + (IN.dispatchThreadID.y * _NumTilesX);
+        _OutFrustumsVS[index] = cone;
+    }
+#endif
+}

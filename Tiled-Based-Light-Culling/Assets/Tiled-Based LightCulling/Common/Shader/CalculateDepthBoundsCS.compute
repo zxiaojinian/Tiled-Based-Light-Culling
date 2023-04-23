@@ -1,0 +1,610 @@
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "TiledBaseCSInclude.hlsl"
+
+//#pragma enable_d3d11_debug_symbols
+
+#pragma multi_compile _ _PARALLELREDUCTION
+#pragma multi_compile _ _FRUSTUM_CONE
+#pragma multi_compile _ _MODIFIED_HALFZ _2_5_D
+
+#pragma kernel CalculateDepthBoundsCS
+
+#define TILE_SIZE_HALF (TILE_SIZE/2)
+#define NUM_THREADS_DEPTHBOUND (TILE_SIZE_HALF*TILE_SIZE_HALF)
+#define NUM_THREADS_HALF (NUM_THREADS_DEPTHBOUND/2)
+
+Texture2D _DepthTexture;
+RWTexture2D<float4> _OutDepthBounds;
+
+//gpu pro 6
+#if defined(_PARALLELREDUCTION)
+    groupshared float ldsZMin[NUM_THREADS_DEPTHBOUND];
+    groupshared float ldsZMax[NUM_THREADS_DEPTHBOUND];
+    groupshared uint ldsTileDepthMask[NUM_THREADS_DEPTHBOUND];
+
+    void ParallelReduction(ComputeShaderInput IN)
+    {
+        //uint threadNum = IN.groupIndex;
+        // Min and max using parallel reduction, with the loop manually unrolled for 
+        // 8x8 thread groups (64 threads per thread group)
+        //if (threadNum < 32)
+        //{
+        //    ldsZMin[threadNum] = min(ldsZMin[threadNum],ldsZMin[threadNum+32]);
+        //    ldsZMax[threadNum] = max(ldsZMax[threadNum],ldsZMax[threadNum+32]);
+        //    ldsZMin[threadNum] = min(ldsZMin[threadNum],ldsZMin[threadNum+16]);
+        //    ldsZMax[threadNum] = max(ldsZMax[threadNum],ldsZMax[threadNum+16]);
+        //    ldsZMin[threadNum] = min(ldsZMin[threadNum],ldsZMin[threadNum+8]);
+        //    ldsZMax[threadNum] = max(ldsZMax[threadNum],ldsZMax[threadNum+8]);
+        //    ldsZMin[threadNum] = min(ldsZMin[threadNum],ldsZMin[threadNum+4]);
+        //    ldsZMax[threadNum] = max(ldsZMax[threadNum],ldsZMax[threadNum+4]);
+        //    ldsZMin[threadNum] = min(ldsZMin[threadNum],ldsZMin[threadNum+2]);
+        //    ldsZMax[threadNum] = max(ldsZMax[threadNum],ldsZMax[threadNum+2]);
+        //    ldsZMin[threadNum] = min(ldsZMin[threadNum],ldsZMin[threadNum+1]);
+        //    ldsZMax[threadNum] = max(ldsZMax[threadNum],ldsZMax[threadNum+1]);
+        //}
+        //GroupMemoryBarrierWithGroupSync();
+
+        //http://diaryofagraphicsprogrammer.blogspot.com/2014/03/compute-shader-optimizations-for-amd.html
+        [unroll(NUM_THREADS_HALF)]
+        for (uint s = NUM_THREADS_HALF; s > 0; s >>= 1)
+        {
+            if (IN.groupIndex < s)
+            {
+                ldsZMin[IN.groupIndex] = min(ldsZMin[IN.groupIndex], ldsZMin[IN.groupIndex + s]);
+                ldsZMax[IN.groupIndex] = max(ldsZMax[IN.groupIndex], ldsZMax[IN.groupIndex + s]);
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+
+    void ParallelReductionDepthMask(ComputeShaderInput IN)
+    {
+        [unroll(NUM_THREADS_HALF)]
+        for (uint s = NUM_THREADS_HALF; s > 0; s >>= 1)
+        {
+            if (IN.groupIndex < s)
+            {
+                ldsTileDepthMask[IN.groupIndex] = ldsTileDepthMask[IN.groupIndex] | ldsTileDepthMask[IN.groupIndex + s];
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+
+    [numthreads(TILE_SIZE_HALF, TILE_SIZE_HALF, 1)]
+    void CalculateDepthBoundsCS(ComputeShaderInput IN)
+    {
+        uint2 texCoord = IN.dispatchThreadID.xy * 2;
+        uint px = texCoord.x;
+        uint pxp = texCoord.x + 1;
+        uint py = texCoord.y;
+        uint pyp = texCoord.y + 1;
+
+        //TODO存在越界情况，pc上目前来看越界读出为0
+        float depth00 = _DepthTexture.Load(int3(px, py, 0)).r;
+        float depth01 = _DepthTexture.Load(int3(px, pyp, 0)).r;
+        float depth10 = _DepthTexture.Load(int3(pxp, py, 0)).r;
+        float depth11 = _DepthTexture.Load(int3(pxp, pyp, 0)).r;
+        #if UNITY_REVERSED_Z
+            depth00 = 1.0 - depth00;
+            depth01 = 1.0 - depth01;
+            depth10 = 1.0 - depth10;
+            depth11 = 1.0 - depth11;
+        #endif
+
+    #if defined(_FRUSTUM_CONE)
+        float dis00 = length(ScreenToView(float4(px, py, depth00, 1.0)).xyz);
+        float dis01 = length(ScreenToView(float4(px, pyp, depth01, 1.0)).xyz);
+        float dis10 = length(ScreenToView(float4(pxp, py, depth10, 1.0)).xyz);
+        float dis11 = length(ScreenToView(float4(pxp, pyp, depth11, 1.0)).xyz);
+
+        {
+            float minDis00 = dis00;
+            float minDis01 = dis01;
+            float minDis10 = dis10;
+            float minDis11 = dis11;
+
+            //需对视野有天空情况做特殊处理，场景和天空交叉处，控制max depth夹紧场景depth，增加额外的判断，收益怎样？
+            //天空盒处深度为1
+            float maxDis00 = (depth00 != 1.f) ? dis00 : 0.0f;
+            float maxDis01 = (depth01 != 1.f) ? dis01 : 0.0f;
+            float maxDis10 = (depth10 != 1.f) ? dis10 : 0.0f;
+            float maxDis11 = (depth11 != 1.f) ? dis11 : 0.0f;
+
+            //float maxDis00 = dis00;
+            //float maxDis01 = dis01;
+            //float maxDis10 = dis10;
+            //float maxDis11 = dis11;
+
+            ldsZMin[IN.groupIndex] = min(minDis00,min(minDis01,min(minDis10,minDis11)));
+            ldsZMax[IN.groupIndex] = max(maxDis00,max(maxDis01,max(maxDis10,maxDis11)));
+            GroupMemoryBarrierWithGroupSync();
+
+            ParallelReduction(IN);
+        }
+
+        #if defined(_MODIFIED_HALFZ)
+            float minDis = ldsZMin[0];
+            float maxDis = ldsZMax[0];
+            GroupMemoryBarrierWithGroupSync();//下面有写入，需保证写入前所有线程已读取
+            float halfDis = 0.5f*(minDis + maxDis);
+
+            {
+                float minDis00 = (dis00 >= halfDis) ? dis00 : FLT_MAX;
+                float minDis01 = (dis01 >= halfDis) ? dis01 : FLT_MAX;
+                float minDis10 = (dis10 >= halfDis) ? dis10 : FLT_MAX;
+                float minDis11 = (dis11 >= halfDis) ? dis11 : FLT_MAX;
+
+                float maxDis00 = (dis00 <= halfDis) ? dis00 : 0.0f;
+                float maxDis01 = (dis01 <= halfDis) ? dis01 : 0.0f;
+                float maxDis10 = (dis10 <= halfDis) ? dis10 : 0.0f;
+                float maxDis11 = (dis11 <= halfDis) ? dis11 : 0.0f;
+
+                ldsZMin[IN.groupIndex] = min(minDis00,min(minDis01,min(minDis10,minDis11)));
+                ldsZMax[IN.groupIndex] = max(maxDis00,max(maxDis01,max(maxDis10,maxDis11)));
+                GroupMemoryBarrierWithGroupSync();
+
+                ParallelReduction(IN);
+            }
+
+            if(IN.groupIndex == 0)
+            {
+                float minDis2 = ldsZMin[0];
+                float maxDis2 = ldsZMax[0];
+                _OutDepthBounds[IN.groupID.xy] = float4(minDis, maxDis2, minDis2, maxDis);
+            }
+
+        #elif defined(_2_5_D)
+            float minDis = ldsZMin[0];
+            float maxDis = ldsZMax[0];
+            
+            float disRangeRecip = 32.0/(maxDis - minDis);
+            uint disShiftCount00 = max(0, min(31, floor((dis00 - minDis) * disRangeRecip)));
+            uint disShiftCount01 = max(0, min(31, floor((dis01 - minDis) * disRangeRecip)));
+            uint disShiftCount10 = max(0, min(31, floor((dis10 - minDis) * disRangeRecip)));
+            uint disShiftCount11 = max(0, min(31, floor((dis11 - minDis) * disRangeRecip)));
+            uint depthMask = (1 << disShiftCount00) | (1 << disShiftCount01) | (1 << disShiftCount10) | (1 << disShiftCount11);
+
+            ldsTileDepthMask[IN.groupIndex] = depthMask;
+            GroupMemoryBarrierWithGroupSync();
+
+            ParallelReductionDepthMask(IN);
+
+            if(IN.groupIndex == 0)
+            {
+                float tileDepthMask = asfloat(ldsTileDepthMask[0]);
+                _OutDepthBounds[IN.groupID.xy] = float4(minDis, tileDepthMask, 0.0, maxDis);
+            }
+        #else
+            if(IN.groupIndex == 0)
+            {
+                float minDis = ldsZMin[0];
+                float maxDis = ldsZMax[0];
+                _OutDepthBounds[IN.groupID.xy] = float4(minDis, 0.0, 0.0, maxDis);
+            }
+        #endif
+    #else
+
+        #if defined(_MODIFIED_HALFZ)
+            //要求half z，需转换到线性空间
+            float viewPosZ00 = -NDCToView(float4(0, 0, 2.0 * depth00 - 1.0, 1.0)).z;
+            float viewPosZ01 = -NDCToView(float4(0, 0, 2.0 * depth01 - 1.0, 1.0)).z;
+            float viewPosZ10 = -NDCToView(float4(0, 0, 2.0 * depth10 - 1.0, 1.0)).z;
+            float viewPosZ11 = -NDCToView(float4(0, 0, 2.0 * depth11 - 1.0, 1.0)).z;
+
+            {
+                float minZ00 = viewPosZ00;
+                float minZ01 = viewPosZ01;
+                float minZ10 = viewPosZ10;
+                float minZ11 = viewPosZ11;
+
+                //需对视野有天空情况做特殊处理，场景和天空交叉处，控制max depth夹紧场景depth，增加额外的判断，收益怎样？
+                //天空盒处深度为1
+                float maxZ00 = (depth00 != 1.f) ? viewPosZ00 : 0.0;
+                float maxZ01 = (depth01 != 1.f) ? viewPosZ01 : 0.0;
+                float maxZ10 = (depth10 != 1.f) ? viewPosZ10 : 0.0;
+                float maxZ11 = (depth11 != 1.f) ? viewPosZ11 : 0.0;
+                //float maxZ00 = viewPosZ00;
+                //float maxZ01 = viewPosZ01;
+                //float maxZ10 = viewPosZ10;
+                //float maxZ11 = viewPosZ11;
+
+                // Initialize shared memory
+                ldsZMin[IN.groupIndex] = min(minZ00,min(minZ01,min(minZ10,minZ11)));
+                ldsZMax[IN.groupIndex] = max(maxZ00,max(maxZ01,max(maxZ10,maxZ11)));
+                GroupMemoryBarrierWithGroupSync();
+
+                ParallelReduction(IN);
+            }
+
+            float minZ = ldsZMin[0];
+            float maxZ = ldsZMax[0];
+            maxZ = (maxZ == 0.0 && minZ > 0) ? minZ : maxZ;//避免：该tile范围全为天空，aabb为z[1,0],导致大量不正确光影通过aabb测试，这种情况令max=min
+            GroupMemoryBarrierWithGroupSync();//下面有写入，需保证写入前所有线程已读取
+            float halfZ = 0.5f*(minZ + maxZ);
+
+            {
+                float minZ00 = ( viewPosZ00 >= halfZ ) ? viewPosZ00 : FLT_MAX;
+                float minZ01 = ( viewPosZ01 >= halfZ ) ? viewPosZ01 : FLT_MAX;
+                float minZ10 = ( viewPosZ10 >= halfZ ) ? viewPosZ10 : FLT_MAX;
+                float minZ11 = ( viewPosZ11 >= halfZ ) ? viewPosZ11 : FLT_MAX;
+
+                float maxZ00 = ( viewPosZ00 <= halfZ ) ? viewPosZ00 : 0.0f;
+                float maxZ01 = ( viewPosZ01 <= halfZ ) ? viewPosZ01 : 0.0f;
+                float maxZ10 = ( viewPosZ10 <= halfZ ) ? viewPosZ10 : 0.0f;
+                float maxZ11 = ( viewPosZ11 <= halfZ ) ? viewPosZ11 : 0.0f;
+
+                // Initialize shared memory
+                ldsZMin[IN.groupIndex] = min(minZ00,min(minZ01,min(minZ10,minZ11)));
+                ldsZMax[IN.groupIndex] = max(maxZ00,max(maxZ01,max(maxZ10,maxZ11)));
+                GroupMemoryBarrierWithGroupSync();
+
+                ParallelReduction(IN);
+            }
+
+            if(IN.groupIndex == 0)
+            {
+                float minZ2 = ldsZMin[0];
+                float maxZ2 = ldsZMax[0];
+                _OutDepthBounds[IN.groupID.xy] = -float4(minZ, maxZ2, minZ2, maxZ);
+            }
+
+        #elif defined(_2_5_D)
+            float viewPosZ00 = -NDCToView(float4(0, 0, 2.0 * depth00 - 1.0, 1.0)).z;
+            float viewPosZ01 = -NDCToView(float4(0, 0, 2.0 * depth01 - 1.0, 1.0)).z;
+            float viewPosZ10 = -NDCToView(float4(0, 0, 2.0 * depth10 - 1.0, 1.0)).z;
+            float viewPosZ11 = -NDCToView(float4(0, 0, 2.0 * depth11 - 1.0, 1.0)).z;
+
+            {
+                float minZ00 = viewPosZ00;
+                float minZ01 = viewPosZ01;
+                float minZ10 = viewPosZ10;
+                float minZ11 = viewPosZ11;
+
+                //需对视野有天空情况做特殊处理，场景和天空交叉处，控制max depth夹紧场景depth，增加额外的判断，收益怎样？
+                //天空盒处深度为1
+                float maxZ00 = (depth00 != 1.f) ? viewPosZ00 : 0.0;
+                float maxZ01 = (depth01 != 1.f) ? viewPosZ01 : 0.0;
+                float maxZ10 = (depth10 != 1.f) ? viewPosZ10 : 0.0;
+                float maxZ11 = (depth11 != 1.f) ? viewPosZ11 : 0.0;
+                //float maxZ00 = viewPosZ00;
+                //float maxZ01 = viewPosZ01;
+                //float maxZ10 = viewPosZ10;
+                //float maxZ11 = viewPosZ11;
+
+                // Initialize shared memory
+                ldsZMin[IN.groupIndex] = min(minZ00,min(minZ01,min(minZ10,minZ11)));
+                ldsZMax[IN.groupIndex] = max(maxZ00,max(maxZ01,max(maxZ10,maxZ11)));
+                GroupMemoryBarrierWithGroupSync();
+
+                ParallelReduction(IN);
+            }
+
+            float minZ = ldsZMin[0];
+            float maxZ = ldsZMax[0];
+            maxZ = (maxZ == 0.0 && minZ > 0) ? minZ : maxZ;//避免：该tile范围全为天空，aabb为z[1,0],导致大量不正确光影通过aabb测试，这种情况令max=min
+
+            float disRangeRecip = 32.0/(maxZ - minZ);
+            uint disShiftCount00 = max(0, min(31, floor((viewPosZ00 - minZ) * disRangeRecip)));
+            uint disShiftCount01 = max(0, min(31, floor((viewPosZ01 - minZ) * disRangeRecip)));
+            uint disShiftCount10 = max(0, min(31, floor((viewPosZ10 - minZ) * disRangeRecip)));
+            uint disShiftCount11 = max(0, min(31, floor((viewPosZ11 - minZ) * disRangeRecip)));
+            uint depthMask = (1 << disShiftCount00) | (1 << disShiftCount01) | (1 << disShiftCount10) | (1 << disShiftCount11);
+
+            ldsTileDepthMask[IN.groupIndex] = depthMask;
+            GroupMemoryBarrierWithGroupSync();
+
+            ParallelReductionDepthMask(IN);
+
+            if(IN.groupIndex == 0)
+            {
+                float tileDepthMask = asfloat(ldsTileDepthMask[0]);
+                _OutDepthBounds[IN.groupID.xy] = float4(-minZ, tileDepthMask, 0.0, -maxZ);
+            }
+
+        #else
+
+            {            
+                //需对视野有天空情况做特殊处理，场景和天空交叉处，控制max depth夹紧场景depth，增加额外的判断，收益怎样？
+                //天空盒处深度为1
+                float maxZ00 = (depth00 != 1.f) ? depth00 : 0.0f;
+                float maxZ01 = (depth01 != 1.f) ? depth01 : 0.0f;
+                float maxZ10 = (depth10 != 1.f) ? depth10 : 0.0f;
+                float maxZ11 = (depth11 != 1.f) ? depth11 : 0.0f;
+
+                ldsZMin[IN.groupIndex] = min(depth00,min(depth01,min(depth10,depth11)));
+                ldsZMax[IN.groupIndex] = max(maxZ00,max(maxZ01,max(maxZ10,maxZ11)));
+                GroupMemoryBarrierWithGroupSync();
+
+                ParallelReduction(IN);
+            }  
+
+            if(IN.groupIndex == 0)
+            {
+                float minZ = ldsZMin[0];
+                float maxZ = ldsZMax[0];
+                maxZ = (maxZ == 0.0 && minZ > 0) ? minZ : maxZ;//避免：该tile范围全为天空，aabb为z[1,0],导致大量不正确光影通过aabb测
+                minZ = NDCToView(float4(0, 0, 2.0 * minZ - 1.0, 1.0)).z;
+                maxZ = NDCToView(float4(0, 0, 2.0 * maxZ - 1.0, 1.0)).z;
+                _OutDepthBounds[IN.groupID.xy] = float4(minZ, 0.0, 0.0, maxZ);
+            }
+        #endif
+    #endif
+    }
+
+#else
+
+    groupshared uint ldsZMin;
+    groupshared uint ldsZMax;
+    groupshared uint ldsZMin2;
+    groupshared uint ldsZMax2;
+
+    groupshared uint ldsTileDepthMask;
+
+    [numthreads(TILE_SIZE_HALF, TILE_SIZE_HALF, 1)]
+    void CalculateDepthBoundsCS(ComputeShaderInput IN)
+    {
+
+        uint2 texCoord = IN.dispatchThreadID.xy * 2;
+        uint px = texCoord.x;
+        uint pxp = texCoord.x + 1;
+        uint py = texCoord.y;
+        uint pyp = texCoord.y + 1;
+
+        //TODO存在越界情况，pc上目前来看越界读出为0
+        float depth00 = _DepthTexture.Load(int3(px, py, 0)).r;
+        float depth01 = _DepthTexture.Load(int3(px, pyp, 0)).r;
+        float depth10 = _DepthTexture.Load(int3(pxp, py, 0)).r;
+        float depth11 = _DepthTexture.Load(int3(pxp, pyp, 0)).r;
+        #if UNITY_REVERSED_Z
+            depth00 = 1.0 - depth00;
+            depth01 = 1.0 - depth01;
+            depth10 = 1.0 - depth10;
+            depth11 = 1.0 - depth11;
+        #endif
+
+        if(IN.groupIndex == 0)
+        {
+            ldsZMin = 0x7f7fffff;  // FLT_MAX as a uint
+            ldsZMax = 0;
+            ldsZMin2 = 0x7f7fffff;  // FLT_MAX as a uint
+            ldsZMax2 = 0;
+
+            ldsTileDepthMask = 0;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+    #if defined(_FRUSTUM_CONE)
+        float dis00 = length(ScreenToView(float4(px, py, depth00, 1.0)).xyz);
+        float dis01 = length(ScreenToView(float4(px, pyp, depth01, 1.0)).xyz);
+        float dis10 = length(ScreenToView(float4(pxp, py, depth10, 1.0)).xyz);
+        float dis11 = length(ScreenToView(float4(pxp, pyp, depth11, 1.0)).xyz);
+
+        {
+            float minDis00 = dis00;
+            float minDis01 = dis01;
+            float minDis10 = dis10;
+            float minDis11 = dis11;
+
+            //需对视野有天空情况做特殊处理，场景和天空交叉处，控制max depth夹紧场景depth，增加额外的判断，收益怎样？
+            //天空盒处深度为1
+            float maxDis00 = (depth00 != 1.f) ? dis00 : 0.0f;
+            float maxDis01 = (depth01 != 1.f) ? dis01 : 0.0f;
+            float maxDis10 = (depth10 != 1.f) ? dis10 : 0.0f;
+            float maxDis11 = (depth11 != 1.f) ? dis11 : 0.0f;
+
+            //float maxDis00 = dis00;
+            //float maxDis01 = dis01;
+            //float maxDis10 = dis10;
+            //float maxDis11 = dis11;
+
+            uint curMinDis = asuint(min(minDis00,min(minDis01,min(minDis10,minDis11))));
+            uint curMaxDis = asuint(max(maxDis00,max(maxDis01,max(maxDis10,maxDis11))));
+
+            InterlockedMin(ldsZMin, curMinDis);
+            InterlockedMax(ldsZMax, curMaxDis);
+            GroupMemoryBarrierWithGroupSync();
+        }
+
+        #if defined(_MODIFIED_HALFZ)
+            float minDis = asfloat(ldsZMin);
+            float maxDis = asfloat(ldsZMax);
+            float halfDis = 0.5f*(minDis + maxDis);
+
+            {
+                float minDis00 = (dis00 >= halfDis) ? dis00 : FLT_MAX;
+                float minDis01 = (dis01 >= halfDis) ? dis01 : FLT_MAX;
+                float minDis10 = (dis10 >= halfDis) ? dis10 : FLT_MAX;
+                float minDis11 = (dis11 >= halfDis) ? dis11 : FLT_MAX;
+
+                float maxDis00 = (dis00 <= halfDis) ? dis00 : 0.0f;
+                float maxDis01 = (dis01 <= halfDis) ? dis01 : 0.0f;
+                float maxDis10 = (dis10 <= halfDis) ? dis10 : 0.0f;
+                float maxDis11 = (dis11 <= halfDis) ? dis11 : 0.0f;
+
+                uint curMinDis = asuint(min(minDis00,min(minDis01,min(minDis10,minDis11))));
+                uint curMaxDis = asuint(max(maxDis00,max(maxDis01,max(maxDis10,maxDis11))));
+
+                InterlockedMin(ldsZMin2, curMinDis);
+                InterlockedMax(ldsZMax2, curMaxDis);
+                GroupMemoryBarrierWithGroupSync();
+            }
+
+            if(IN.groupIndex == 0)
+            {
+                float minDis2 = asfloat(ldsZMin2);
+                float maxDis2 = asfloat(ldsZMax2);
+                _OutDepthBounds[IN.groupID.xy] = float4(minDis, maxDis2, minDis2, maxDis);
+            }
+
+        #elif defined(_2_5_D)
+            float minDis = asfloat(ldsZMin);
+            float maxDis = asfloat(ldsZMax);
+            float disRangeRecip = 32.0/(maxDis - minDis);
+            uint disShiftCount00 = max(0, min(31, floor((dis00 - minDis) * disRangeRecip)));
+            uint disShiftCount01 = max(0, min(31, floor((dis01 - minDis) * disRangeRecip)));
+            uint disShiftCount10 = max(0, min(31, floor((dis10 - minDis) * disRangeRecip)));
+            uint disShiftCount11 = max(0, min(31, floor((dis11 - minDis) * disRangeRecip)));
+            uint depthMask = (1 << disShiftCount00) | (1 << disShiftCount01) | (1 << disShiftCount10) | (1 << disShiftCount11);
+            InterlockedOr(ldsTileDepthMask, depthMask);   
+            GroupMemoryBarrierWithGroupSync();
+
+            if(IN.groupIndex == 0)
+            {
+                float tileDepthMask = asfloat(ldsTileDepthMask);
+                _OutDepthBounds[IN.groupID.xy] = float4(minDis, tileDepthMask, 0.0, maxDis);
+            }
+        #else
+            if(IN.groupIndex == 0)
+            {
+                float minDis = asfloat(ldsZMin);
+                float maxDis = asfloat(ldsZMax);
+                _OutDepthBounds[IN.groupID.xy] = float4(minDis, 0.0, 0.0, maxDis);
+            }
+        #endif
+    #else
+
+        #if defined(_MODIFIED_HALFZ)
+            //要求half z，需转换到线性空间
+            float viewPosZ00 = -NDCToView(float4(0, 0, 2.0 * depth00 - 1.0, 1.0)).z;
+            float viewPosZ01 = -NDCToView(float4(0, 0, 2.0 * depth01 - 1.0, 1.0)).z;
+            float viewPosZ10 = -NDCToView(float4(0, 0, 2.0 * depth10 - 1.0, 1.0)).z;
+            float viewPosZ11 = -NDCToView(float4(0, 0, 2.0 * depth11 - 1.0, 1.0)).z;
+
+            {
+                float minZ00 = viewPosZ00;
+                float minZ01 = viewPosZ01;
+                float minZ10 = viewPosZ10;
+                float minZ11 = viewPosZ11;
+
+                //需对视野有天空情况做特殊处理，场景和天空交叉处，控制max depth夹紧场景depth，增加额外的判断，收益怎样？
+                //天空盒处深度为1
+                float maxZ00 = (depth00 != 1.f) ? viewPosZ00 : 0.0;
+                float maxZ01 = (depth01 != 1.f) ? viewPosZ01 : 0.0;
+                float maxZ10 = (depth10 != 1.f) ? viewPosZ10 : 0.0;
+                float maxZ11 = (depth11 != 1.f) ? viewPosZ11 : 0.0;
+                //float maxZ00 = viewPosZ00;
+                //float maxZ01 = viewPosZ01;
+                //float maxZ10 = viewPosZ10;
+                //float maxZ11 = viewPosZ11;
+
+                uint curMinZ = asuint(min(minZ00,min(minZ01,min(minZ10,minZ11))));
+                uint curMaxZ = asuint(max(maxZ00,max(maxZ01,max(maxZ10,maxZ11))));
+
+                InterlockedMin(ldsZMin, curMinZ);
+                InterlockedMax(ldsZMax, curMaxZ);
+                GroupMemoryBarrierWithGroupSync();
+            }
+
+            float minZ = asfloat(ldsZMin);
+            float maxZ = asfloat(ldsZMax);
+            maxZ = (maxZ == 0.0 && minZ > 0) ? minZ : maxZ;//避免：该tile范围全为天空，aabb为z[1,0],导致大量不正确光影通过aabb测试，这种情况令max=min
+            float halfZ = 0.5f*(minZ + maxZ);
+
+            {
+                float minZ00 = ( viewPosZ00 >= halfZ ) ? viewPosZ00 : FLT_MAX;
+                float minZ01 = ( viewPosZ01 >= halfZ ) ? viewPosZ01 : FLT_MAX;
+                float minZ10 = ( viewPosZ10 >= halfZ ) ? viewPosZ10 : FLT_MAX;
+                float minZ11 = ( viewPosZ11 >= halfZ ) ? viewPosZ11 : FLT_MAX;
+
+                float maxZ00 = ( viewPosZ00 <= halfZ ) ? viewPosZ00 : 0.0f;
+                float maxZ01 = ( viewPosZ01 <= halfZ ) ? viewPosZ01 : 0.0f;
+                float maxZ10 = ( viewPosZ10 <= halfZ ) ? viewPosZ10 : 0.0f;
+                float maxZ11 = ( viewPosZ11 <= halfZ ) ? viewPosZ11 : 0.0f;
+
+                uint curMinZ = asuint(min(minZ00,min(minZ01,min(minZ10,minZ11))));
+                uint curMaxZ = asuint(max(maxZ00,max(maxZ01,max(maxZ10,maxZ11))));
+
+                InterlockedMin(ldsZMin2, curMinZ);
+                InterlockedMax(ldsZMax2, curMaxZ);
+                GroupMemoryBarrierWithGroupSync();
+            }
+
+            if(IN.groupIndex == 0)
+            {
+                float minZ2 = asfloat(ldsZMin2);
+                float maxZ2 = asfloat(ldsZMax2);
+                _OutDepthBounds[IN.groupID.xy] = -float4(minZ, maxZ2, minZ2, maxZ);
+            }
+
+        #elif defined(_2_5_D)
+
+            float viewPosZ00 = -NDCToView(float4(0, 0, 2.0 * depth00 - 1.0, 1.0)).z;
+            float viewPosZ01 = -NDCToView(float4(0, 0, 2.0 * depth01 - 1.0, 1.0)).z;
+            float viewPosZ10 = -NDCToView(float4(0, 0, 2.0 * depth10 - 1.0, 1.0)).z;
+            float viewPosZ11 = -NDCToView(float4(0, 0, 2.0 * depth11 - 1.0, 1.0)).z;
+
+            {
+                float minZ00 = viewPosZ00;
+                float minZ01 = viewPosZ01;
+                float minZ10 = viewPosZ10;
+                float minZ11 = viewPosZ11;
+
+                //需对视野有天空情况做特殊处理，场景和天空交叉处，控制max depth夹紧场景depth，增加额外的判断，收益怎样？
+                //天空盒处深度为1
+                float maxZ00 = (depth00 != 1.f) ? viewPosZ00 : 0.0;
+                float maxZ01 = (depth01 != 1.f) ? viewPosZ01 : 0.0;
+                float maxZ10 = (depth10 != 1.f) ? viewPosZ10 : 0.0;
+                float maxZ11 = (depth11 != 1.f) ? viewPosZ11 : 0.0;
+                //float maxZ00 = viewPosZ00;
+                //float maxZ01 = viewPosZ01;
+                //float maxZ10 = viewPosZ10;
+                //float maxZ11 = viewPosZ11;
+
+                uint curMinZ = asuint(min(minZ00,min(minZ01,min(minZ10,minZ11))));
+                uint curMaxZ = asuint(max(maxZ00,max(maxZ01,max(maxZ10,maxZ11))));
+
+                InterlockedMin(ldsZMin, curMinZ);
+                InterlockedMax(ldsZMax, curMaxZ);
+                GroupMemoryBarrierWithGroupSync();
+            }
+
+            float minZ = asfloat(ldsZMin);
+            float maxZ = asfloat(ldsZMax);
+            maxZ = (maxZ == 0.0 && minZ > 0) ? minZ : maxZ;//避免：该tile范围全为天空，aabb为z[1,0],导致大量不正确光影通过aabb测试，这种情况令max=min
+
+            float disRangeRecip = 32.0/(maxZ - minZ);
+            uint disShiftCount00 = max(0, min(31, floor((viewPosZ00 - minZ) * disRangeRecip)));
+            uint disShiftCount01 = max(0, min(31, floor((viewPosZ01 - minZ) * disRangeRecip)));
+            uint disShiftCount10 = max(0, min(31, floor((viewPosZ10 - minZ) * disRangeRecip)));
+            uint disShiftCount11 = max(0, min(31, floor((viewPosZ11 - minZ) * disRangeRecip)));
+            uint depthMask = (1 << disShiftCount00) | (1 << disShiftCount01) | (1 << disShiftCount10) | (1 << disShiftCount11);
+            InterlockedOr(ldsTileDepthMask, depthMask);   
+            GroupMemoryBarrierWithGroupSync();
+
+            if(IN.groupIndex == 0)
+            {
+                float tileDepthMask = asfloat(ldsTileDepthMask);
+                _OutDepthBounds[IN.groupID.xy] = float4(-minZ, tileDepthMask, 0.0, -maxZ);
+            }
+
+        #else
+
+            {            
+                //需对视野有天空情况做特殊处理，场景和天空交叉处，控制max depth夹紧场景depth，增加额外的判断，收益怎样？
+                //天空盒处深度为1
+                float maxZ00 = (depth00 != 1.f) ? depth00 : 0.0f;
+                float maxZ01 = (depth01 != 1.f) ? depth01 : 0.0f;
+                float maxZ10 = (depth10 != 1.f) ? depth10 : 0.0f;
+                float maxZ11 = (depth11 != 1.f) ? depth11 : 0.0f;
+
+                uint curMinZ = asuint(min(depth00,min(depth01,min(depth10,depth11))));
+                uint curMaxZ = asuint(max(maxZ00,max(maxZ01,max(maxZ10,maxZ11))));
+
+                InterlockedMin(ldsZMin, curMinZ);
+                InterlockedMax(ldsZMax, curMaxZ);
+                GroupMemoryBarrierWithGroupSync();
+            }  
+
+            if(IN.groupIndex == 0)
+            {
+                float minZ = asfloat(ldsZMin);
+                float maxZ = asfloat(ldsZMax);
+                maxZ = (maxZ == 0.0 && minZ > 0) ? minZ : maxZ;//避免：该tile范围全为天空，aabb为z[1,0],导致大量不正确光影通过aabb测
+                minZ = NDCToView(float4(0, 0, 2.0 * minZ - 1.0, 1.0)).z;
+                maxZ = NDCToView(float4(0, 0, 2.0 * maxZ - 1.0, 1.0)).z;
+                _OutDepthBounds[IN.groupID.xy] = float4(minZ, 0.0, 0.0, maxZ);
+            }
+        #endif
+    #endif
+    }
+#endif
